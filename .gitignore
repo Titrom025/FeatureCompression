@@ -1,0 +1,9 @@
+*.jpg
+*.png
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.webp
+*logs/
+results/
