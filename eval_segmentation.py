@@ -6,7 +6,7 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 import sys
-# from utils import build_text_embedding
+from utils import build_dino_text_embedding
 from omegaconf import OmegaConf
 from math import sqrt
 from torchvision import transforms
@@ -32,7 +32,7 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-def build_text_embedding(categories):
+def build_clip_text_embedding(categories):
     """Build CLIP text embeddings for given categories."""
     model, _ = clip.load("ViT-L/14@336px")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -81,50 +81,6 @@ def extract_dino_features(model, image_paths, device):
         features[img_path] = patch_grid
     return features
 
-class Autoencoder(nn.Module):
-    def __init__(self, input_dim, latent_dim):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, latent_dim * 2),
-            nn.ReLU(),
-            nn.Linear(latent_dim * 2, latent_dim)
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim * 2),
-            nn.ReLU(),
-            nn.Linear(latent_dim * 2, input_dim)
-        )
-
-    def forward(self, x):
-        z = self.encoder(x)
-        return self.decoder(z), z
-
-def fit_pca(all_feats, dim):
-    pca = PCA(n_components=dim)
-    pca.fit(all_feats)
-    return pca
-
-def compress_with_pca(pca, feats):
-    H, W, D = feats.shape
-    flat = feats.reshape(-1, D)
-    proj = pca.transform(flat)
-    return proj.reshape(H, W, -1)
-
-def train_autoencoder(all_feats, latent_dim, device, epochs=20, lr=1e-3):
-    input_dim = all_feats.shape[1]
-    model = Autoencoder(input_dim, latent_dim).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    data = torch.from_numpy(all_feats).float().to(device)
-    for epoch in range(epochs):
-        optimizer.zero_grad()
-        recon, _ = model(data)
-        loss = ((recon - data) ** 2).mean()
-        loss.backward()
-        optimizer.step()
-        if epoch % 5 == 0:
-            print(f"AE Epoch {epoch}/{epochs}, MSE={loss.item():.4f}")
-    return model
-
 def generate_masks(image_feat, text_emb, target_dims):
     """Generate segmentation masks using interpolation.
     
@@ -146,54 +102,6 @@ def generate_masks(image_feat, text_emb, target_dims):
     
     return mask
 
-def main(args):
-    set_seed(args.seed)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    image_paths = [os.path.join(args.image_dir, f) for f in os.listdir(args.image_dir)
-                   if f.endswith((".jpg", ".png"))]
-    print(f"Found {len(image_paths)} images in {args.image_dir}")
-
-    # Only DINO for now
-    cfg = OmegaConf.load(args.dino_cfg)
-    dino_model = build_model(cfg.model)
-    feats = extract_dino_features(dino_model, image_paths, device)
-
-    # Prepare data for compression
-    all_feats = np.concatenate([v.reshape(-1, v.shape[2]) for v in feats.values()], axis=0)
-    print(f"Total feature vectors for compression: {all_feats.shape}")
-
-    # Build compressors
-    compressors = {}
-    for method in args.methods:
-        for dim in args.dims:
-            key = f"{method}_{dim}"
-            if method == 'pca':
-                pca = fit_pca(all_feats, dim)
-                compressors[key] = ('pca', pca)
-                print(f"Fitted PCA for dim={dim}")
-            elif method == 'ae':
-                ae = train_autoencoder(all_feats, dim, device, epochs=args.ae_epochs)
-                compressors[key] = ('ae', ae)
-                print(f"Trained Autoencoder for dim={dim}")
-
-    # Apply compression and save
-    os.makedirs(args.output_dir, exist_ok=True)
-    for img_path, feat_arr in feats.items():
-        basename = os.path.splitext(os.path.basename(img_path))[0]
-        for key, (method, comp) in compressors.items():
-            if method == 'pca':
-                compressed = compress_with_pca(comp, feat_arr)
-            else:
-                flat = torch.from_numpy(feat_arr.reshape(-1, feat_arr.shape[2])).float().to(device)
-                with torch.no_grad(): _, z = comp(flat)
-                compressed = z.cpu().numpy().reshape(feat_arr.shape[0], feat_arr.shape[1], -1)
-            out_fname = f"{basename}_dino_{key}.npy"
-            np.save(os.path.join(args.output_dir, out_fname), compressed)
-            print(f"Saved {out_fname}")
-
-    print(f"Feature extraction and compression complete. Results in {args.output_dir}")
-
 def eval_talk2dino(args):
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -214,7 +122,7 @@ def eval_talk2dino(args):
     
     # Build text embeddings once
     with torch.no_grad():
-        text_emb = build_text_embedding(labelset)
+        text_emb = build_dino_text_embedding(labelset, dino_model, device)
         text_emb = text_emb.squeeze(-1).squeeze(0).squeeze(0).to(device)
     
     # Initialize metrics storage
@@ -381,7 +289,7 @@ def eval_openseg(args):
     palette, labelset = metric_utils.get_text_requests(args.dataset_type)
     
     # Build text embeddings once
-    text_embedding = build_text_embedding(labelset)
+    text_embedding = build_clip_text_embedding(labelset)
     text_embedding_tf = tf.reshape(text_embedding, [-1, 1, text_embedding.shape[-1]])
     text_embedding_tf = tf.cast(text_embedding_tf, tf.float32)
     
@@ -525,12 +433,9 @@ def eval_openseg(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, choices=["extract_compress", "dino", "openseg"], default="dino", help="Model: extract_compress, dino, clip, or openseg")
+    parser.add_argument("--model", type=str, choices=["dino", "openseg"], default="dino", help="Model: extract_compress, dino, clip, or openseg")
     parser.add_argument("--image_dir", type=str, default="/media/titrom/storage/mipt/datasets/ScanNet_12/val/scene0050_02/color/", help="Path to input images (for extract_compress)")
     parser.add_argument("--output_dir", type=str, default="results/", help="Directory to save results (for both modes)")
-    parser.add_argument("--methods", type=str, default=["pca"], nargs='+', choices=["pca", "ae"], help="Compression methods to apply (for extract_compress)")
-    parser.add_argument("--dims", type=int, nargs='+', default=[16], help="Target dimensions for compression (for extract_compress)")
-    parser.add_argument("--ae_epochs", type=int, default=20, help="Epochs for autoencoder training (for extract_compress)")
     parser.add_argument("--scenes_dir", type=str, default="/media/titrom/storage/mipt/datasets/ScanNet_12/val/", help="Path to directory containing ScanNet scenes (for eval)")
     parser.add_argument("--label_file", type=str, default="scannetv2-labels.modified.tsv", help="Label mapping file (e.g. scannetv2-labels.modified.tsv) (for eval)")
     parser.add_argument("--dataset_type", type=str, default="cocomap", help="Dataset type (cocomap or scannet20) (for eval)")
@@ -539,12 +444,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     args = parser.parse_args()
 
-    if args.model == "extract_compress":
-        if not args.image_dir or not args.output_dir or not args.methods:
-            print(f"Please provide --image_dir, --output_dir, and --methods for extract_compress mode.")
-            exit(1)
-        main(args)
-    elif args.model == "dino":
+    if args.model == "dino":
         if not args.scenes_dir or not args.label_file:
             print(f"Please provide --scenes_dir and --label_file for eval mode.")
             exit(1)
