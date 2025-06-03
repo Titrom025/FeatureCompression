@@ -21,8 +21,6 @@ from models import build_model  # assumes models.py is available
 
 import clip
 
-from sklearn.decomposition import PCA
-import torch.nn as nn
 import metric_utils
 
 def set_seed(seed):

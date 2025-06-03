@@ -83,7 +83,7 @@ def focal2fov(focal: float, pixels: int) -> float:
     return 2 * np.arctan(pixels / (2 * focal))
 
 
-def build_text_embedding(categories, dino_model, device="cuda"):
+def build_dino_text_embedding(categories, dino_model, device="cuda"):
     """Build text embeddings for given categories."""
     tokens = []
     templates = [
