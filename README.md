@@ -58,6 +58,11 @@ mim install "mmcv-full==1.6.2"
 mim install "mmsegmentation==0.27.0"
 ```
 
+#### OpenSeg Model
+
+Download the pre-trained OpenSeg model from [this link](https://disk.yandex.ru/d/dX01s1XBe3Uf8w).  
+After downloading, place the model file into the `REPO_ROOT/openseg_model` directory.
+
 ---
 
 ## 🧪 Run Evaluation
