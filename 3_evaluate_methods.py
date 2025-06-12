@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import argparse, csv, json, sys, random
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Tuple, Union
 
 import numpy as np
 import torch
@@ -25,58 +25,131 @@ import metric_utils, cv2, os
 from PIL import Image
 from torchvision import transforms as T
 from utils import build_dino_text_embedding
+import tensorflow as tf2
+import tensorflow.compat.v1 as tf
+import clip
+from models_to_train import LinearCompressor, ShallowAE, DeepAE
+
+# ----------------------------------------------------------------------------
+#  OpenSeg utilities
+# ----------------------------------------------------------------------------
+
+def load_openseg_model(model_path: str):
+    """Load OpenSeg model and configure GPU settings"""
+    # Reset TensorFlow's GPU configuration
+    tf.keras.backend.clear_session()
     
-from models_to_train import LinearEncoder, ShallowAE, DeepAE
+    # Get available GPUs
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        tf.config.experimental.set_memory_growth(gpus[0], True)
+        tf.config.experimental.set_synchronous_execution(False)
+        tf.config.set_logical_device_configuration(
+            gpus[0],
+            [tf.config.LogicalDeviceConfiguration(memory_limit=1024 * 6)])
+    
+    return tf2.saved_model.load(model_path, tags=[tf.saved_model.tag_constants.SERVING])
+
+def extract_openseg_features(model, img_path: str, text_embedding_tf: np.ndarray, device: torch.device) -> torch.Tensor:
+    """Extract features from OpenSeg model"""
+    with tf.io.gfile.GFile(img_path, 'rb') as f:
+        np_image_string = np.array([f.read()])
+    
+    with torch.no_grad():
+        output = model.signatures['serving_default'](
+            inp_image_bytes=tf.convert_to_tensor(np_image_string[0]),
+            inp_text_emb=text_embedding_tf)
+    
+    # Get segmentation mask and crop features
+    image = output['image'].numpy()
+    non_zero_mask = np.any(image != 0, axis=2)
+    y_indices, x_indices = np.nonzero(non_zero_mask)
+    min_y, max_y = y_indices.min(), y_indices.max()
+    min_x, max_x = x_indices.min(), x_indices.max()
+    
+    # Get features and convert to torch tensor
+    embedding_feat_square = output['ppixel_ave_feat'].numpy()
+    embedding_feat = embedding_feat_square[:, min_y:max_y+1, min_x:max_x+1, :]
+    embedding_feat = torch.from_numpy(embedding_feat).to(device)
+    
+    # Convert to BCHW format
+    return embedding_feat.permute(0, 3, 1, 2)
+
+def build_clip_text_embedding(categories):
+    """Build CLIP text embeddings for given categories."""
+    model, _ = clip.load("ViT-L/14@336px")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    with torch.no_grad():
+        all_text_embeddings = []
+        print(f"Building text embeddings...")
+        for category in tqdm(categories):
+            texts = clip.tokenize(category).to(device)
+            text_embeddings = model.encode_text(texts)
+            text_embeddings /= text_embeddings.norm(dim=-1, keepdim=True)
+            text_embedding = text_embeddings.mean(dim=0)
+            text_embedding /= text_embedding.norm()
+            all_text_embeddings.append(text_embedding)
+
+        all_text_embeddings = torch.stack(all_text_embeddings, dim=1)
+    return all_text_embeddings.T.float()
+
 # ----------------------------------------------------------------------------
-#  Minimal model stubs for learned compressors
+#  Model loading and feature extraction
 # ----------------------------------------------------------------------------
 
-def _build_model_stub(method: str, d_in: int, d_out: int) -> nn.Module:
-    if method in {"lin_proj", "sim_kd"}: return LinearEncoder(d_in, d_out)
-    if method == "ae_shallow": return ShallowAE(d_in, d_out)
-    if method == "ae_deep": return DeepAE(d_in, d_out)
-    raise ValueError(method)
-
-# ----------------------------------------------------------------------------
-#  Compressor class (PCA / RandProj / learned)
-# ----------------------------------------------------------------------------
-
-class Compressor:
-    def __init__(self, method: str, ckpt_path: Path, d_in: int, d_out: int):
-        self.method, self.d_in, self.d_out = method, d_in, d_out
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.encoder, self.W, self.mean = None, None, None
-
-        if method == "pca":
-            npz = np.load(ckpt_path)
-            self.mean = torch.from_numpy(npz["mean_"]).float().to(self.device)
-            self.W = torch.from_numpy(npz["components_"]).float().to(self.device)  # (d,C)
-        elif method == "rand_proj":
-            W = torch.from_numpy(np.load(ckpt_path)).float()
-            self.W = W.t() if W.shape[0] == d_in else W  # ensure (d,C)
-            self.W = self.W.to(self.device)
+def load_model(method: str, ckpt_path: Path, d_in: int, d_out: int, device: torch.device) -> Tuple[Union[nn.Module, Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None], str]:
+    """Load model or projection matrix based on method"""
+    if method == "raw":
+        # No model, no compression
+        return None, "raw"
+    if method == "pca":
+        npz = np.load(ckpt_path)
+        mean = torch.from_numpy(npz["mean_"]).float().to(device)
+        W = torch.from_numpy(npz["components_"]).float().to(device)  # (d,C)
+        return (mean, W), "pca"
+    elif method == "rand_proj":
+        W = torch.from_numpy(np.load(ckpt_path)).float()
+        W = W.t() if W.shape[0] == d_in else W  # ensure (d,C)
+        W = W.to(device)
+        return W, "rand_proj"
+    else:
+        if method in {"lin_proj", "sim_kd"}:
+            model = LinearCompressor(d_in, d_out)
+        elif method == "ae_shallow":
+            model = ShallowAE(d_in, d_out)
+        elif method == "ae_deep":
+            model = DeepAE(d_in, d_out)
         else:
-            self.encoder = _build_model_stub(method, d_in, d_out).to(self.device)
-            ckpt = torch.load(ckpt_path, map_location=self.device)
-            self.encoder.load_state_dict(ckpt["model"], strict=False)
-            self.encoder.eval().requires_grad_(False)
+            raise ValueError(f"Unknown method: {method}")
+        
+        ckpt = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ckpt["model"], strict=False)
+        model.to(device).eval().requires_grad_(False)
+        return model, "learned"
 
-    # --------------------------------------------------------------------
-    def encode(self, x: torch.Tensor) -> torch.Tensor:  # (N,C)->(N,d)
-        if self.encoder is not None:
-            z = self.encoder.encode(x) if hasattr(self.encoder, "encode") else self.encoder(x)
-        elif self.method == "pca":
-            z = (x - self.mean) @ self.W.t()
-        else:  # rand_proj
-            z = x @ self.W.t()
-        return F.normalize(z, dim=-1)
+def encode_features(x: torch.Tensor, model_or_W: Union[nn.Module, Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None], method_type: str) -> torch.Tensor:
+    """Encode features using the loaded model or projection matrix"""
+    if method_type == "raw":
+        z = x
+    elif method_type == "pca":
+        mean, W = model_or_W
+        z = (x - mean) @ W.t()
+    elif method_type == "rand_proj":
+        W = model_or_W
+        z = x @ W.t()
+    else:  # learned
+        model = model_or_W
+        z = model.encode(x) if hasattr(model, "encode") else model(x)
+    return F.normalize(z, dim=-1)
 
-    def encode_map(self, fmap: torch.Tensor) -> torch.Tensor:  # (B,C,H,W)->(B,d,H,W)
-        B, C, H, W = fmap.shape
-        flat = fmap.permute(0, 2, 3, 1).reshape(-1, C)
-        with torch.no_grad():
-            z = self.encode(flat)
-        return z.reshape(B, H, W, self.d_out).permute(0, 3, 1, 2).contiguous()
+def encode_feature_map(fmap: torch.Tensor, model_or_W: Union[nn.Module, Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None], method_type: str) -> torch.Tensor:
+    """Encode feature map using the loaded model or projection matrix"""
+    B, C, H, W = fmap.shape
+    flat = fmap.permute(0, 2, 3, 1).reshape(-1, C)
+    with torch.no_grad():
+        z = encode_features(flat, model_or_W, method_type)
+    return z.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
 
 # ----------------------------------------------------------------------------
 #  Filesystem helpers
@@ -84,7 +157,9 @@ class Compressor:
 
 _CKPT_FILES = {"pca": "pca.npz", "rand_proj": "rand.npy", "default": "model.pt"}
 
-def _find_ckpt(path: Path) -> Path:
+def _find_ckpt(path: Path, method: str = None) -> Path:
+    if method == "raw":
+        return None
     for f in _CKPT_FILES.values():
         fp = path / f
         if fp.exists():
@@ -131,23 +206,45 @@ def _load_dino_backbone(cfg_path: str, device):
 # ----------------------------------------------------------------------------
 
 def _infer_C(backbone: str) -> int:
-    return 1024 if backbone == "clip" else 768
+    return 768 if backbone == "openseg" else 768
 
-def eval_compressor(leaf: Path, scenes_dir: Path, label_file: Path, dino_cfg: str, device, n_frames_per_scene: int = None, frame_seed: int = 42) -> Dict:
+def eval_compressor(leaf: Union[Path, str], scenes_dir: Path, label_file: Path, dino_cfg: str, device, openseg_model=None, text_embedding_tf=None, n_frames_per_scene: int = None, frame_seed: int = 42) -> Dict:
+    # If method_override is set, use it instead of inferring from leaf
     backbone, method, dim = leaf.parents[1].name, leaf.parents[0].name, int(leaf.name)
-    ckpt_path = _find_ckpt(leaf)
-    compressor = Compressor(method, ckpt_path, _infer_C(backbone), dim)
+    
+    # Load appropriate model based on backbone
+    if backbone == "openseg":
+        if openseg_model is None:
+            raise ValueError("OpenSeg model must be provided for openseg backbone")
+        extractor = lambda x: extract_openseg_features(openseg_model, x, text_embedding_tf, device)
+    else:
+        dino_model, extractor = _load_dino_backbone(dino_cfg, device)
+    
+    if method == "raw":
+        model_or_W, method_type = load_model("raw", None, dim, dim, device)
+    else:
+        ckpt_path = _find_ckpt(leaf, method=method)
+        model_or_W, method_type = load_model(method, ckpt_path, _infer_C(backbone), dim, device)
 
     # -------- load DINO model & text embeddings
-    dino_model, extractor = _load_dino_backbone(dino_cfg, device)
     palette, labelset = metric_utils.get_text_requests("cocomap")
     label_map = metric_utils.read_label_mapping(str(label_file), label_to="cocomapid")
-    text_orig = build_dino_text_embedding(labelset, dino_model, device).squeeze().to(device)
-    text_emb = compressor.encode(text_orig).cpu()
+    
+    if backbone == "openseg":
+        # Use OpenSeg text embeddings
+        text_orig = build_clip_text_embedding(labelset)
+        if text_embedding_tf is None:
+            text_embedding_tf = tf.reshape(text_orig.cpu().numpy(), [-1, 1, text_orig.shape[-1]])
+            text_embedding_tf = tf.cast(text_embedding_tf, tf.float32)
+    else:
+        # Use DINO text embeddings
+        text_orig = build_dino_text_embedding(labelset, dino_model, device).squeeze().to(device)
+    
+    text_emb = encode_features(text_orig, model_or_W, method_type).cpu()
 
     # Create output directory for predicted semantic images
-    pred_dir = leaf / "pred_semantics"
-    pred_dir.mkdir(exist_ok=True)
+    pred_dir = leaf / f"pred_semantics_frames{n_frames_per_scene}"
+    pred_dir.mkdir(exist_ok=True, parents=True)
 
     scenes = [s for s in scenes_dir.iterdir() if (s/"color").exists()]
     per_scene = {}
@@ -167,8 +264,13 @@ def eval_compressor(leaf: Path, scenes_dir: Path, label_file: Path, dino_cfg: st
         for img_p in tqdm(imgs, desc=f"{scene.name}"):
             img = Image.open(img_p).convert("RGB")
             img_t = T.ToTensor()(img).unsqueeze(0).to(device) * 255.0
-            feats = extractor(img_t)
-            feats_c = compressor.encode_map(feats)
+            
+            if backbone == "openseg":
+                feats = extractor(str(img_p))
+            else:
+                feats = extractor(img_t)
+                
+            feats_c = encode_feature_map(feats, model_or_W, method_type)
             sim = torch.einsum('b c h w, n c -> b n h w', feats_c, text_emb.to(device))
             sim = F.interpolate(sim, img_t.shape[2:], mode='bilinear', align_corners=True)
             pred = torch.argmax(sim.squeeze(0), 0).cpu().numpy()
@@ -210,9 +312,23 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     ckpt_root = Path(args.ckpt_root)
     rows = []
+    
+    csv_p = ckpt_root/f"summary_frames{args.n_frames_per_scene}.csv"
+    if csv_p.exists():
+        print(f"✓ Exists. CSV at {csv_p}")
+        return
 
+    # Initialize OpenSeg model and text embeddings once
+    print("Initializing OpenSeg model...")
+    openseg_model = load_openseg_model("./openseg_model")
+    palette, labelset = metric_utils.get_text_requests("cocomap")
+    text_orig = build_clip_text_embedding(labelset)
+    text_embedding_tf = tf.reshape(text_orig.cpu().numpy(), [-1, 1, text_orig.shape[-1]])
+    text_embedding_tf = tf.cast(text_embedding_tf, tf.float32)
+
+    # Evaluate all discovered compressors
     for leaf in discover_leaves(ckpt_root):
-        seg_file = leaf/"seg_metrics.json"
+        seg_file = leaf/f"seg_metrics_frames{args.n_frames_per_scene}.json"
         if seg_file.exists():
             with open(seg_file) as fp: seg = json.load(fp)
         else:
@@ -223,6 +339,8 @@ def main():
                     Path(args.label_file),
                     args.dino_cfg,
                     device,
+                    openseg_model=openseg_model if leaf.parents[1].name == "openseg" else None,
+                    text_embedding_tf=text_embedding_tf if leaf.parents[1].name == "openseg" else None,
                     n_frames_per_scene=args.n_frames_per_scene,
                     frame_seed=args.frame_seed
                 )
@@ -238,8 +356,36 @@ def main():
             "overall_mIoU": seg["overall_mIoU"],
             "overall_mAcc": seg["overall_mAcc"]})
 
+    # Add "raw" method (no compression, original dim) for both dino and clip
+    for backbone, dim in [("openseg", 768), ("dino", 768)]:
+        print(f"Evaluating raw (no compression) method for {backbone}...")
+        leaf = Path(f"{ckpt_root}/{backbone}/raw/{dim}")
+        try:
+            seg = eval_compressor(
+                leaf,  # dummy, not a Path
+                Path(args.scenes_dir),
+                Path(args.label_file),
+                args.dino_cfg,
+                device,
+                openseg_model=openseg_model if backbone == "openseg" else None,
+                text_embedding_tf=text_embedding_tf if backbone == "openseg" else None,
+                n_frames_per_scene=args.n_frames_per_scene,
+                frame_seed=args.frame_seed
+            )
+            rows.append({
+                "backbone": backbone,
+                "method": "raw",
+                "dim": dim,
+                "overall_mIoU": seg["overall_mIoU"],
+                "overall_mAcc": seg["overall_mAcc"]
+            })
+        except Exception as e:
+            error_path = Path(args.scenes_dir).parent / f"seg_error_raw_{backbone}.txt"
+            error_path.write_text(str(e))
+            print(f"[ERROR] raw {backbone} {e}")
+            raise e
+
     # summary CSV
-    csv_p = ckpt_root/"summary.csv"
     with open(csv_p, "w", newline="") as fp:
         w = csv.DictWriter(fp, fieldnames=rows[0].keys()); w.writeheader(); w.writerows(rows)
     print(f"✓ Done. CSV at {csv_p}")
