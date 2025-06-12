@@ -134,7 +134,6 @@ def evaluate_confusion(scene_name, confusion, stdout=False, dataset="scannet20")
     else:
         raise NotImplementedError
     N_CLASSES = len(CLASS_LABELS)
-    print("num_classes:", N_CLASSES)
 
     class_ious = {}
     class_accs = {}

@@ -9,3 +9,14 @@
 
 results/
 __pycache__
+openseg_model*
+
+*.npy
+*.pt
+*.npz
+*.json
+*.csv
+*.txt
+*.log
+*.pth
+*.pkl
